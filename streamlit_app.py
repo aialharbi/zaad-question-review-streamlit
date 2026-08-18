@@ -1286,6 +1286,7 @@ def main() -> None:
         login_screen()
 
     database = bootstrap()
+    create_schema(database)
     st.session_state["_assignment_reviewers"] = active_reviewer_usernames(database)
     questions = load_questions()
     if auth.get("role") == "admin":
