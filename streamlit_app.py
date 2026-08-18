@@ -14,7 +14,7 @@ from typing import Any
 import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_FILE = APP_DIR / "data" / "questions_core_answer_first_500.jsonl"
+DATA_FILE = APP_DIR / "data" / "questions_retrieval_test_best.jsonl"
 LOCAL_DB_FILE = APP_DIR / "local_review_state.sqlite3"
 
 DECISIONS = {
@@ -513,7 +513,7 @@ def inject_css() -> None:
 
 
 def login_screen() -> str:
-    st.markdown('<div class="app-title">مراجعة الأسئلة الذهبية لكتاب زاد المعاد</div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-title">مراجعة أسئلة زاد المعاد المنتقاة من اختبار الاسترجاع</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtle">الدخول بالاسم فقط. سيُحفظ كل حكم وتعديل وملاحظة باسم المراجع.</div>', unsafe_allow_html=True)
     default_name = st.session_state.get("reviewer_name", "")
     name = st.text_input("اسم المراجع", value=default_name, placeholder="اكتب اسمك هنا")
