@@ -110,6 +110,41 @@ def display_name(username: str) -> str:
     return configured_users().get(username, {}).get("display_name", username)
 
 
+def reviewer_usernames() -> tuple[str, ...]:
+    users = configured_users()
+    ordered = [username for username in REVIEWER_ORDER if users.get(username, {}).get("role") == "reviewer"]
+    extras = sorted(
+        username
+        for username, config in users.items()
+        if config.get("role") == "reviewer" and username not in ordered
+    )
+    return tuple(ordered + extras)
+
+
+def sanitize_reviewer_selection(selected: list[str] | tuple[str, ...] | None) -> list[str]:
+    available = reviewer_usernames()
+    seen: set[str] = set()
+    result: list[str] = []
+    for username in selected or []:
+        if username in available and username not in seen:
+            seen.add(username)
+            result.append(username)
+    return result
+
+
+def assignment_reviewers() -> tuple[str, ...]:
+    current = st.session_state.get("_assignment_reviewers")
+    if current:
+        return tuple(current)
+    return reviewer_usernames()
+
+
+def reviewer_for_index(index: int, reviewers: tuple[str, ...] | list[str]) -> str:
+    if not reviewers:
+        return ""
+    return reviewers[(max(index, 1) - 1) % len(reviewers)]
+
+
 def get_secret_database_url() -> str | None:
     try:
         database = st.secrets.get("database", {})
@@ -243,6 +278,16 @@ def create_schema(database: ReviewDB) -> None:
         )
         """
     )
+    database.run(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL,
+            updated_by TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
 
 
 def import_questions(database: ReviewDB, questions: list[dict[str, Any]]) -> None:
@@ -297,6 +342,57 @@ def bootstrap() -> ReviewDB:
     create_schema(database)
     import_questions(database, questions)
     return database
+
+
+def fetch_setting(database: ReviewDB, key: str) -> str | None:
+    rows = database.fetchall(
+        "SELECT setting_value FROM app_settings WHERE setting_key = :setting_key",
+        {"setting_key": key},
+    )
+    return rows[0]["setting_value"] if rows else None
+
+
+def save_setting(database: ReviewDB, key: str, value: str, updated_by: str) -> None:
+    database.run(
+        """
+        INSERT INTO app_settings (setting_key, setting_value, updated_by, updated_at)
+        VALUES (:setting_key, :setting_value, :updated_by, :updated_at)
+        ON CONFLICT (setting_key) DO UPDATE SET
+            setting_value = excluded.setting_value,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+        """,
+        {
+            "setting_key": key,
+            "setting_value": value,
+            "updated_by": updated_by,
+            "updated_at": utc_now(),
+        },
+    )
+
+
+def active_reviewer_usernames(database: ReviewDB) -> tuple[str, ...]:
+    raw = fetch_setting(database, "active_reviewers")
+    selected: list[str] = []
+    if raw:
+        try:
+            value = json.loads(raw)
+            if isinstance(value, list):
+                selected = [str(item) for item in value]
+        except json.JSONDecodeError:
+            selected = []
+    sanitized = sanitize_reviewer_selection(selected)
+    if sanitized:
+        return tuple(sanitized)
+    return reviewer_usernames()
+
+
+def save_active_reviewer_usernames(database: ReviewDB, reviewers: list[str], updated_by: str) -> None:
+    sanitized = sanitize_reviewer_selection(reviewers)
+    if not sanitized:
+        raise ValueError("at_least_one_reviewer")
+    save_setting(database, "active_reviewers", json.dumps(sanitized, ensure_ascii=False), updated_by)
+    record_event(database, "__settings__", updated_by, "save_active_reviewers", {"active_reviewers": sanitized})
 
 
 def record_event(database: ReviewDB, question_id: str, reviewer_name: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
@@ -414,8 +510,8 @@ def save_review(
 
 
 def assigned_reviewer(question: dict[str, Any]) -> str:
-    index = max(as_int(question.get("review_bank_index"), 1), 1)
-    return REVIEWER_ORDER[(index - 1) % len(REVIEWER_ORDER)]
+    index = as_int(question.get("review_bank_index"), 1)
+    return reviewer_for_index(index, assignment_reviewers())
 
 
 def source_files(question: dict[str, Any]) -> list[str]:
@@ -726,8 +822,10 @@ def render_reviewer_sidebar(questions: list[dict[str, Any]], reviews: dict[str, 
 
 def render_admin_sidebar(questions: list[dict[str, Any]], grouped_reviews: dict[str, list[dict[str, Any]]]) -> dict[str, str]:
     assigned_done = sum(1 for q in questions if assigned_review_for(q, grouped_reviews))
+    active_count = len(assignment_reviewers())
     st.sidebar.markdown('<div class="account-card"><b>الأدمن</b><br><span class="subtle">admin</span></div>', unsafe_allow_html=True)
     logout_button()
+    st.sidebar.metric("المراجعون النشطون", active_count)
     st.sidebar.metric("المعتمد في سير العمل", assigned_done, f"من {len(questions)}")
     st.sidebar.progress(assigned_done / len(questions) if questions else 0)
     st.sidebar.divider()
@@ -940,16 +1038,20 @@ def assignment_progress_rows(questions: list[dict[str, Any]], grouped_reviews: d
 
 def reviewer_summary_rows(questions: list[dict[str, Any]], grouped_reviews: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     rows = []
-    for username in REVIEWER_ORDER:
+    active = set(assignment_reviewers())
+    for username in reviewer_usernames():
         assigned = [q for q in questions if assigned_reviewer(q) == username]
         reviewed = sum(1 for q in assigned if any(r.get("reviewer_name") == username for r in grouped_reviews.get(q["question_id"], [])))
+        saved_reviews = sum(1 for reviews in grouped_reviews.values() for row in reviews if row.get("reviewer_name") == username)
         rows.append(
             {
                 "المراجع": display_name(username),
                 "اسم المستخدم": username,
+                "حالة التوزيع": "نشط" if username in active else "غير نشط",
                 "المكلف بها": len(assigned),
-                "راجع": reviewed,
+                "راجع من تكليفه": reviewed,
                 "المتبقي": len(assigned) - reviewed,
+                "كل مراجعاته المحفوظة": saved_reviews,
                 "نسبة الإنجاز": f"{(reviewed / len(assigned) * 100):.1f}%" if assigned else "0%",
             }
         )
@@ -1027,6 +1129,47 @@ def export_questions_csv(questions: list[dict[str, Any]]) -> str:
     return export_rows_csv(rows)
 
 
+def distribution_preview_rows(questions: list[dict[str, Any]], reviewers: list[str]) -> list[dict[str, Any]]:
+    rows = []
+    for username in reviewers:
+        count = sum(
+            1
+            for question in questions
+            if reviewer_for_index(as_int(question.get("review_bank_index"), 1), reviewers) == username
+        )
+        rows.append({"المراجع": display_name(username), "اسم المستخدم": username, "عدد الأسئلة المتوقع": count})
+    return rows
+
+
+def render_active_reviewer_controls(database: ReviewDB, questions: list[dict[str, Any]]) -> None:
+    available = list(reviewer_usernames())
+    current = [username for username in assignment_reviewers() if username in available]
+    st.markdown('<div class="section-title">تحديد المراجعين النشطين للتوزيع</div>', unsafe_allow_html=True)
+    st.caption("الأدمن يحدد من سيُحسب عليهم توزيع الأسئلة في هذه الدورة. تغيير القائمة يعيد حساب التكليفات الحالية، مع بقاء أي مراجعات محفوظة في قاعدة البيانات بأسماء أصحابها.")
+    with st.form("active_reviewers_form"):
+        selected = st.multiselect(
+            "المراجعون النشطون",
+            options=available,
+            default=current,
+            format_func=lambda username: f"{display_name(username)} ({username})",
+        )
+        submitted = st.form_submit_button("حفظ توزيع المراجعين", type="primary", width="stretch")
+    if submitted:
+        sanitized = sanitize_reviewer_selection(selected)
+        if not sanitized:
+            st.warning("اختر مراجعًا واحدًا على الأقل حتى يمكن توزيع الأسئلة.")
+        else:
+            save_active_reviewer_usernames(database, sanitized, "admin")
+            st.session_state["_assignment_reviewers"] = tuple(sanitized)
+            st.session_state.pop("selected_question_id", None)
+            st.success("تم حفظ قائمة المراجعين النشطين وإعادة حساب التوزيع.")
+            st.rerun()
+
+    preview = distribution_preview_rows(questions, current)
+    if preview:
+        st.dataframe(preview, width="stretch", hide_index=True)
+
+
 def render_admin_downloads(questions: list[dict[str, Any]], all_reviews: list[dict[str, Any]], grouped_reviews: dict[str, list[dict[str, Any]]]) -> None:
     cols = st.columns(3)
     with cols[0]:
@@ -1080,6 +1223,9 @@ def render_reviewer_app(database: ReviewDB, questions: list[dict[str, Any]], aut
     allowed = [q for q in questions if assigned_reviewer(q) == username]
     visible = filtered_for_reviewer(questions, reviews, username, sidebar["status_filter"], sidebar["search"])
     st.markdown('<div class="app-title">مراجعة الأسئلة المكلف بها</div>', unsafe_allow_html=True)
+    if username not in assignment_reviewers():
+        st.info("حسابك غير مفعّل حاليًا ضمن توزيع هذه الدورة. يمكن للأدمن إضافتك من لوحة الإدارة عند الحاجة.")
+        return
     if st.session_state.get("save_notice"):
         st.success(st.session_state.pop("save_notice"))
     if not visible:
@@ -1103,6 +1249,8 @@ def render_admin_app(database: ReviewDB, questions: list[dict[str, Any]]) -> Non
     total_reviews = len(all_reviews)
 
     st.markdown('<div class="app-title">لوحة إدارة مراجعة الأسئلة</div>', unsafe_allow_html=True)
+    render_active_reviewer_controls(database, questions)
+    st.divider()
     metric_cols = st.columns(4)
     metric_cols[0].metric("إجمالي الأسئلة", len(questions))
     metric_cols[1].metric("راجعها المكلف", reviewed_assigned)
@@ -1138,6 +1286,7 @@ def main() -> None:
         login_screen()
 
     database = bootstrap()
+    st.session_state["_assignment_reviewers"] = active_reviewer_usernames(database)
     questions = load_questions()
     if auth.get("role") == "admin":
         render_admin_app(database, questions)
