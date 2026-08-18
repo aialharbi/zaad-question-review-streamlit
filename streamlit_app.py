@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from difflib import SequenceMatcher
 import html
 import io
 import json
@@ -30,18 +31,20 @@ REVIEWER_ORDER = tuple(username for username, user in DEFAULT_USERS.items() if u
 
 DECISIONS = {
     "approved": "اعتماد",
-    "approved_prefer_edit": "اعتماد مع تفضيل تعديل",
-    "approved_must_edit": "اعتماد مع وجوب تعديل",
     "rejected": "رفض",
 }
 LEGACY_DECISIONS = {
-    "approved_with_edit": "اعتماد مع تفضيل تعديل",
-    "needs_revision": "اعتماد مع وجوب تعديل",
+    "approved_with_edit": "اعتماد",
+    "approved_prefer_edit": "اعتماد",
+    "needs_revision": "اعتماد",
+    "approved_must_edit": "اعتماد",
 }
 DECISION_LABELS = {**DECISIONS, **LEGACY_DECISIONS}
 LEGACY_DECISION_MAP = {
-    "approved_with_edit": "approved_prefer_edit",
-    "needs_revision": "approved_must_edit",
+    "approved_with_edit": "approved",
+    "approved_prefer_edit": "approved",
+    "needs_revision": "approved",
+    "approved_must_edit": "approved",
 }
 
 STATUS_OPTIONS = {
@@ -85,6 +88,71 @@ def as_int(value: Any, fallback: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def as_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def normalize_for_change(text_value: str | None) -> str:
+    normalized = normalize_arabic(text_value or "")
+    normalized = normalized.replace("ـ", "")
+    normalized = re.sub(r"[^\w\s؀-ۿ]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def text_change_rate(original: str | None, edited: str | None) -> float:
+    original_norm = normalize_for_change(original)
+    edited_norm = normalize_for_change(edited)
+    if original_norm == edited_norm:
+        return 0.0
+    if not original_norm or not edited_norm:
+        return 100.0
+
+    sequence_similarity = SequenceMatcher(None, original_norm, edited_norm).ratio()
+    original_words = set(original_norm.split())
+    edited_words = set(edited_norm.split())
+    word_union = original_words | edited_words
+    word_overlap = (len(original_words & edited_words) / len(word_union)) if word_union else sequence_similarity
+    length_gap = abs(len(original_norm) - len(edited_norm)) / max(len(original_norm), len(edited_norm), 1)
+    length_similarity = 1 - min(length_gap, 1)
+    smart_similarity = (0.60 * sequence_similarity) + (0.30 * word_overlap) + (0.10 * length_similarity)
+    return round(max(0.0, min(100.0, (1 - smart_similarity) * 100)), 1)
+
+
+def review_change_metrics(question: dict[str, Any], edited_question: str | None, edited_answer: str | None) -> dict[str, float]:
+    question_rate = text_change_rate(question.get("question", ""), edited_question or "")
+    answer_rate = text_change_rate(question.get("short_answer", ""), edited_answer or "")
+    question_weight = max(len(normalize_for_change(question.get("question", ""))), len(normalize_for_change(edited_question or "")), 1)
+    answer_weight = max(len(normalize_for_change(question.get("short_answer", ""))), len(normalize_for_change(edited_answer or "")), 1)
+    overall = ((question_rate * question_weight) + (answer_rate * answer_weight)) / (question_weight + answer_weight)
+    return {
+        "question_change_rate": question_rate,
+        "answer_change_rate": answer_rate,
+        "overall_change_rate": round(overall, 1),
+    }
+
+
+def metric_or_computed(review: dict[str, Any], key: str, computed: dict[str, float]) -> float:
+    stored = review.get(key)
+    stored_rate = as_float(stored, computed[key])
+    if stored in (None, "", 0, 0.0, "0", "0.0") and computed[key] > 0:
+        return computed[key]
+    return round(stored_rate, 1)
+
+
+def review_metrics_for_export(question: dict[str, Any], review: dict[str, Any] | None) -> dict[str, float]:
+    if not review:
+        return {"question_change_rate": 0.0, "answer_change_rate": 0.0, "overall_change_rate": 0.0}
+    computed = review_change_metrics(question, review.get("edited_question", ""), review.get("edited_answer", ""))
+    return {
+        "question_change_rate": metric_or_computed(review, "question_change_rate", computed),
+        "answer_change_rate": metric_or_computed(review, "answer_change_rate", computed),
+        "overall_change_rate": metric_or_computed(review, "overall_change_rate", computed),
+    }
 
 
 def configured_users() -> dict[str, dict[str, str]]:
@@ -259,6 +327,9 @@ def create_schema(database: ReviewDB) -> None:
             decision TEXT NOT NULL,
             edited_question TEXT NOT NULL,
             edited_answer TEXT NOT NULL,
+            question_change_rate REAL NOT NULL DEFAULT 0,
+            answer_change_rate REAL NOT NULL DEFAULT 0,
+            overall_change_rate REAL NOT NULL DEFAULT 0,
             notes TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -288,6 +359,26 @@ def create_schema(database: ReviewDB) -> None:
         )
         """
     )
+    ensure_review_metric_columns(database)
+
+
+def ensure_review_metric_columns(database: ReviewDB) -> None:
+    metric_columns = {
+        "question_change_rate": "REAL NOT NULL DEFAULT 0",
+        "answer_change_rate": "REAL NOT NULL DEFAULT 0",
+        "overall_change_rate": "REAL NOT NULL DEFAULT 0",
+    }
+    if database.is_postgres():
+        for column in metric_columns:
+            database.run(
+                f"ALTER TABLE review_state ADD COLUMN IF NOT EXISTS {column} DOUBLE PRECISION NOT NULL DEFAULT 0"
+            )
+        return
+
+    existing = {row.get("name") for row in database.fetchall("PRAGMA table_info(review_state)")}
+    for column, definition in metric_columns.items():
+        if column not in existing:
+            database.run(f"ALTER TABLE review_state ADD COLUMN {column} {definition}")
 
 
 def import_questions(database: ReviewDB, questions: list[dict[str, Any]]) -> None:
@@ -425,6 +516,7 @@ def fetch_reviews(database: ReviewDB, reviewer_name: str) -> dict[str, dict[str,
     rows = database.fetchall(
         """
         SELECT question_id, reviewer_name, decision, edited_question, edited_answer,
+               question_change_rate, answer_change_rate, overall_change_rate,
                notes, created_at, updated_at
         FROM review_state
         WHERE reviewer_name = :reviewer_name
@@ -438,6 +530,7 @@ def fetch_all_reviews(database: ReviewDB) -> list[dict[str, Any]]:
     return database.fetchall(
         """
         SELECT question_id, reviewer_name, decision, edited_question, edited_answer,
+               question_change_rate, answer_change_rate, overall_change_rate,
                notes, created_at, updated_at
         FROM review_state
         ORDER BY updated_at DESC
@@ -453,6 +546,9 @@ def save_review(
     decision: str,
     edited_question: str,
     edited_answer: str,
+    question_change_rate: float,
+    answer_change_rate: float,
+    overall_change_rate: float,
     notes: str,
 ) -> None:
     stamp = utc_now()
@@ -460,6 +556,9 @@ def save_review(
         "decision": decision,
         "edited_question": edited_question,
         "edited_answer": edited_answer,
+        "question_change_rate": question_change_rate,
+        "answer_change_rate": answer_change_rate,
+        "overall_change_rate": overall_change_rate,
         "notes": notes,
     }
     database.run_many([
@@ -467,16 +566,21 @@ def save_review(
             """
             INSERT INTO review_state (
                 question_id, reviewer_name, decision, edited_question,
-                edited_answer, notes, created_at, updated_at
+                edited_answer, question_change_rate, answer_change_rate,
+                overall_change_rate, notes, created_at, updated_at
             )
             VALUES (
                 :question_id, :reviewer_name, :decision, :edited_question,
-                :edited_answer, :notes, :created_at, :updated_at
+                :edited_answer, :question_change_rate, :answer_change_rate,
+                :overall_change_rate, :notes, :created_at, :updated_at
             )
             ON CONFLICT (question_id, reviewer_name) DO UPDATE SET
                 decision = excluded.decision,
                 edited_question = excluded.edited_question,
                 edited_answer = excluded.edited_answer,
+                question_change_rate = excluded.question_change_rate,
+                answer_change_rate = excluded.answer_change_rate,
+                overall_change_rate = excluded.overall_change_rate,
                 notes = excluded.notes,
                 updated_at = excluded.updated_at
             """,
@@ -486,6 +590,9 @@ def save_review(
                 "decision": decision,
                 "edited_question": edited_question,
                 "edited_answer": edited_answer,
+                "question_change_rate": question_change_rate,
+                "answer_change_rate": answer_change_rate,
+                "overall_change_rate": overall_change_rate,
                 "notes": notes,
                 "created_at": stamp,
                 "updated_at": stamp,
@@ -967,12 +1074,12 @@ def render_reviewer_question(
 
     with st.form(f"review_form_{question['question_id']}"):
         edited_question = st.text_area(
-            "السؤال",
+            "السؤال المعدل",
             value=(review.get("edited_question") if review else None) or question.get("question", ""),
             height=92,
         )
         edited_answer = st.text_area(
-            "الإجابة المختصرة",
+            "الإجابة المعدلة",
             value=(review.get("edited_answer") if review else None) or question.get("short_answer", ""),
             height=118,
         )
@@ -990,6 +1097,7 @@ def render_reviewer_question(
         if not clean_text(edited_question) or not clean_text(edited_answer):
             st.warning("لا يمكن حفظ سؤال أو جواب فارغ.")
         else:
+            metrics = review_change_metrics(question, edited_question, edited_answer)
             save_review(
                 database,
                 question_id=question["question_id"],
@@ -997,6 +1105,9 @@ def render_reviewer_question(
                 decision=decision,
                 edited_question=edited_question.strip(),
                 edited_answer=edited_answer.strip(),
+                question_change_rate=metrics["question_change_rate"],
+                answer_change_rate=metrics["answer_change_rate"],
+                overall_change_rate=metrics["overall_change_rate"],
                 notes=notes.strip(),
             )
             target_id = next_question_id(visible, question["question_id"])
@@ -1014,6 +1125,7 @@ def assignment_progress_rows(questions: list[dict[str, Any]], grouped_reviews: d
         assigned = assigned_reviewer(question)
         assigned_review = assigned_review_for(question, grouped_reviews)
         all_reviews = grouped_reviews.get(question["question_id"], [])
+        metrics = review_metrics_for_export(question, assigned_review)
         rows.append(
             {
                 "رقم السؤال": question.get("review_bank_index"),
@@ -1025,8 +1137,13 @@ def assignment_progress_rows(questions: list[dict[str, Any]], grouped_reviews: d
                 "آخر تحديث": (assigned_review or {}).get("updated_at", ""),
                 "عدد المراجعات على السؤال": len(all_reviews),
                 "المراجعون الذين راجعوه": ", ".join(display_name(r.get("reviewer_name", "")) for r in all_reviews),
-                "السؤال": question.get("question", ""),
-                "الإجابة المختصرة": question.get("short_answer", ""),
+                "السؤال الأصلي": question.get("question", ""),
+                "السؤال المعدل": (assigned_review or {}).get("edited_question", ""),
+                "معدل تغيير السؤال %": metrics["question_change_rate"],
+                "الإجابة الأصلية": question.get("short_answer", ""),
+                "الإجابة المعدلة": (assigned_review or {}).get("edited_answer", ""),
+                "معدل تغيير الإجابة %": metrics["answer_change_rate"],
+                "معدل التغيير الكلي %": metrics["overall_change_rate"],
                 "المجال": question.get("primary_discipline", ""),
                 "الموضوع": question.get("primary_topic", ""),
                 "الملف": " / ".join(source_files(question)),
@@ -1075,6 +1192,7 @@ def export_reviews_csv(questions: list[dict[str, Any]], review_rows: list[dict[s
         if reviewer_name and review.get("reviewer_name") != reviewer_name:
             continue
         question = question_by_id.get(review["question_id"], {})
+        metrics = review_metrics_for_export(question, review)
         rows.append(
             {
                 "question_id": review.get("question_id", ""),
@@ -1083,12 +1201,15 @@ def export_reviews_csv(questions: list[dict[str, Any]], review_rows: list[dict[s
                 "reviewer_name": review.get("reviewer_name", ""),
                 "reviewer_display_name": display_name(review.get("reviewer_name", "")),
                 "decision": review.get("decision", ""),
-                "decision_label": DECISION_LABELS.get(review.get("decision", ""), review.get("decision", "")),
-                "original_question": question.get("question", ""),
-                "edited_question": review.get("edited_question", ""),
-                "original_answer": question.get("short_answer", ""),
-                "edited_answer": review.get("edited_answer", ""),
-                "notes": review.get("notes", ""),
+                "الحكم": DECISION_LABELS.get(review.get("decision", ""), review.get("decision", "")),
+                "السؤال الأصلي": question.get("question", ""),
+                "السؤال المعدل": review.get("edited_question", ""),
+                "معدل تغيير السؤال %": metrics["question_change_rate"],
+                "الإجابة الأصلية": question.get("short_answer", ""),
+                "الإجابة المعدلة": review.get("edited_answer", ""),
+                "معدل تغيير الإجابة %": metrics["answer_change_rate"],
+                "معدل التغيير الكلي %": metrics["overall_change_rate"],
+                "الملاحظات": review.get("notes", ""),
                 "primary_discipline": question.get("primary_discipline", ""),
                 "primary_topic": question.get("primary_topic", ""),
                 "source_files": ", ".join(source_files(question)) if question else "",
@@ -1197,18 +1318,23 @@ def render_admin_question(question: dict[str, Any], grouped_reviews: dict[str, l
     rows = grouped_reviews.get(question["question_id"], [])
     if rows:
         st.markdown('<div class="section-title">مراجعات هذا السؤال</div>', unsafe_allow_html=True)
-        review_table = [
-            {
-                "المراجع": display_name(row.get("reviewer_name", "")),
-                "اسم المستخدم": row.get("reviewer_name", ""),
-                "الحكم": DECISION_LABELS.get(row.get("decision", ""), row.get("decision", "")),
-                "السؤال بعد التعديل": row.get("edited_question", ""),
-                "الجواب بعد التعديل": row.get("edited_answer", ""),
-                "الملاحظات": row.get("notes", ""),
-                "آخر تحديث": row.get("updated_at", ""),
-            }
-            for row in rows
-        ]
+        review_table = []
+        for row in rows:
+            metrics = review_metrics_for_export(question, row)
+            review_table.append(
+                {
+                    "المراجع": display_name(row.get("reviewer_name", "")),
+                    "اسم المستخدم": row.get("reviewer_name", ""),
+                    "الحكم": DECISION_LABELS.get(row.get("decision", ""), row.get("decision", "")),
+                    "السؤال المعدل": row.get("edited_question", ""),
+                    "معدل تغيير السؤال %": metrics["question_change_rate"],
+                    "الإجابة المعدلة": row.get("edited_answer", ""),
+                    "معدل تغيير الإجابة %": metrics["answer_change_rate"],
+                    "معدل التغيير الكلي %": metrics["overall_change_rate"],
+                    "الملاحظات": row.get("notes", ""),
+                    "آخر تحديث": row.get("updated_at", ""),
+                }
+            )
         st.dataframe(review_table, width="stretch", hide_index=True)
     else:
         st.info("لا توجد مراجعة محفوظة لهذا السؤال بعد.")
