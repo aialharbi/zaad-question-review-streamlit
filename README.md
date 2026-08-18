@@ -1,6 +1,6 @@
 # Streamlit Question Review App
 
-تطبيق خفيف لمراجعة أسئلة منتقاة من ملف اختبار الاسترجاع لزاد المعاد. يدخل المراجع باسمه فقط، ثم يحفظ حكمه وتعديلاته على السؤال والجواب باسمه في قاعدة البيانات.
+تطبيق خفيف لمراجعة أسئلة زاد المعاد المنتقاة من ملف اختبار الاسترجاع، مع توزيع ثابت على المراجعين ولوحة إدارة لمتابعة سير العمل وتنزيل النتائج.
 
 ## التشغيل المحلي
 
@@ -11,30 +11,25 @@ python3 -m streamlit run streamlit_app.py
 
 إذا لم تضبط قاعدة PostgreSQL سيستخدم التطبيق SQLite محليًا في ملف `local_review_state.sqlite3`.
 
+## حسابات الدخول
+
+الحسابات لا تُحفظ في الكود. أضفها في Streamlit Secrets أو في ملف `.streamlit/secrets.toml` المحلي غير المرفوع إلى GitHub. انظر القالب في `.streamlit/secrets.example.toml`.
+
+يتم توزيع الأسئلة آليًا بالتتابع على المراجعين الخمسة، وتدعم قاعدة البيانات وجود أكثر من مراجعة للسؤال الواحد باسم كل مراجع.
+
 ## النشر على Streamlit Community Cloud
 
 1. ارفع مجلد `streamlit_question_review_app` إلى GitHub ضمن المستودع.
 2. في Streamlit Cloud اختر ملف الدخول:
    `streamlit_question_review_app/streamlit_app.py`
-3. أضف سر قاعدة البيانات في إعدادات التطبيق المتقدمة:
-
-```toml
-DATABASE_URL = "postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require"
-```
-
-أو:
-
-```toml
-[database]
-url = "postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require"
-```
+3. أضف سر قاعدة البيانات وحسابات الدخول في إعدادات التطبيق المتقدمة.
 
 ## قاعدة البيانات
 
-يوصى بـ PostgreSQL مثل Neon أو Supabase لهذه المرحلة؛ لأنه يحفظ مراجعات عدة أشخاص بالتزامن. التطبيق ينشئ الجداول تلقائيًا:
+يوصى بـ PostgreSQL مثل Supabase لهذه المرحلة؛ لأنه يحفظ مراجعات عدة أشخاص بالتزامن. التطبيق ينشئ الجداول تلقائيًا:
 
 - `question_source`: نسخة مرجعية من الأسئلة ومقاطعها.
-- `review_state`: آخر مراجعة لكل سؤال حسب اسم المراجع.
+- `review_state`: آخر مراجعة لكل سؤال حسب اسم المستخدم.
 - `review_events`: سجل أحداث للحفظ وفتح الأسئلة.
 
 لا ترفع ملف `.streamlit/secrets.toml` الحقيقي إلى GitHub.
